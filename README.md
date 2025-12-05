@@ -4,12 +4,15 @@
 
 ## Echo TTS Streaming API
 - Run: `python api_server.py` (uses `PORT` env var, default `8000`; FastAPI lifespan loads models and optional compile caches).
+- Optional dependency: install `ffmpeg` (e.g., `apt-get install ffmpeg` or the official builds on Windows/macOS) if you want non-stream outputs encoded to MP3 by default.
 - Endpoint: `POST /v1/audio/speech` with body fields:
-  - `input` (text), `voice` (name of a prompt file or folder under `audio_prompts/`; accepts explicit filenames/extensions, base64-encoded audio, or directory names when folder support is on; folders are concatenated—per file with 1s gaps—before encoding), `stream` (bool, default true), `seed`, `extra_body` (sampler overrides such as `block_sizes`, `num_steps`, `chunking_enabled`, `chunk_target_seconds`, etc.).
-- Streaming responses emit raw PCM bytes with header `X-Audio-Sample-Rate: 44100`. Non-stream returns a single chunk.
+  - `input` (text), `voice` (name of a prompt file or folder under `audio_prompts/`; accepts explicit filenames/extensions, base64-encoded audio, or directory names when folder support is on; folders are concatenated—per file with 1s gaps—before encoding), `response_format` (`pcm` for streaming; non-stream supports `wav` or `mp3` when ffmpeg is available—default `mp3` if present, otherwise `wav`), `stream` (bool, default true), `seed`, `extra_body` (sampler overrides such as `block_sizes`, `num_steps`, `chunking_enabled`, `chunk_target_seconds`, etc.).
+- Text normalization: prompts are normalized for Echo TTS; `[S1]` is automatically prefixed when missing.
+- Streaming responses emit raw PCM bytes with header `X-Audio-Sample-Rate: 44100` (`response_format='pcm'` only). Non-stream returns a single chunk; default format is MP3 when ffmpeg is available (falls back to WAV otherwise).
 - Chunking: enabled by default; long text is split into timed chunks (target 30s, min 20s, max 40s) based on chars/word per second heuristics. Each chunk is synthesized separately and streamed in order; secondary chunks default to the non-stream block shape unless overridden.
 - Streaming defaults: `DEFAULT_BLOCK_SIZES = [32, 128, 480]` and `DEFAULT_NUM_STEPS = [8, 15, 20]` are tuned for real-time streaming with low TTFB (~200–300ms on a 3090 when compiled).
 - Voices: accepts single prompt files or whole folders (if enabled) under `audio_prompts/`; base64 voices are also supported.
+- Voices listing: `GET /v1/voices` returns an OpenAI-style list of voices (`object: voice`, `id`, `name`) sourced from `audio_prompts/` (files and folders with audio when folder support is on).
 - Debug: when enabled, last generation is saved to `api_generation.wav`.
 - Example (streaming PCM, voice `expresso_02_ex03-ex01_calm_005`):
 ```bash
@@ -24,6 +27,37 @@ curl -X POST http://localhost:8000/v1/audio/speech \
     "extra_body": {}
   }'
 ```
+- Example (streaming PCM with stronger speaker forcing via `speaker_kv_scale`):
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  --output out.pcm \
+  -d '{
+    "input": "[S1] Please stick to the reference speaker.",
+    "voice": "expresso_02_ex03-ex01_calm_005",
+    "stream": true,
+    "seed": 0,
+    "extra_body": {
+      "speaker_kv_scale": 1.25,
+      "speaker_kv_min_t": 0.9,
+      "speaker_kv_max_layers": 24
+    }
+  }'
+```
+- Example (non-stream, WAV response):
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  --output out.wav \
+  -d '{
+    "input": "[S1] Hello, this is a WAV response example.",
+    "voice": "expresso_02_ex03-ex01_calm_005",
+    "stream": false,
+    "response_format": "wav",
+    "seed": 0,
+    "extra_body": {}
+  }'
+```
 
 ### Server Environment Flags
 - `ECHO_MODEL_REPO` (default `jordand/echo-tts-base`) selects the main model; `ECHO_FISH_REPO` (default `jordand/fish-s1-dac-min`) selects the decoder.
@@ -32,7 +66,17 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 - Cache/logging: `ECHO_CACHE_DIR` (default `/tmp`) and `ECHO_CACHE_VERSION` label saved compile artifacts; `ECHO_CACHE_SPEAKER_ON_GPU` (default `0`) caches speaker latents per device; `ECHO_DEBUG_LOGS` (default `0`) enables verbose timing/debug prints.
 - Chunking/text defaults: `ECHO_CHUNKING` (default `1`), `ECHO_CHUNK_CHARS_PER_SECOND` (default `14`), `ECHO_CHUNK_WORDS_PER_SECOND` (default `2.7`).
 - Reference audio handling: `ECHO_MAX_SPEAKER_LATENT_LENGTH` (default `6400`), `ECHO_FOLDER_SUPPORT` (default `1` to allow folder prompts), `ECHO_WARMUP_VOICE` and `ECHO_WARMUP_TEXT` seed optional compile warmup.
+- Optional dependency: ffmpeg (on PATH) is required for `response_format='mp3'`; when present, non-stream defaults to MP3, otherwise WAV.
+- Performance presets (streaming only): `ECHO_PERFORMANCE_PRESET` (default `default`) sets streaming sampler defaults: `default` uses `block_sizes=[32, 128, 480]` / `num_steps=[8, 15, 20]`; `low_mid` keeps those blocks with `num_steps=[8, 10, 15]`; `low` uses `block_sizes=[32, 64, 272, 272]` and `num_steps=[8, 10, 15, 15]`. Unknown values fall back to default with a warning; non-streaming uses its own steps.
+- Non-streaming steps: `ECHO_NUM_STEPS_NONSTREAM` (default `20`) controls the fixed non-stream sampler steps (recommended range 10–40); block size stays `640` by default unless overridden via request.
 - Note: enabling `torch.compile` (model and/or decoder) can increase peak VRAM; disable `ECHO_COMPILE`/`ECHO_COMPILE_AE` if memory is tight.
+
+### Performance / VRAM notes
+- Quick presets (streaming): set `ECHO_PERFORMANCE_PRESET=low_mid` to reduce steps or `ECHO_PERFORMANCE_PRESET=low` to also shrink blocks; both lower compute/VRAM at some quality cost. Non-streaming always defaults to 20 steps unless you set `ECHO_NUM_STEPS_NONSTREAM` (10–40 recommended).
+- Lower-end GPUs: prefer `ECHO_PERFORMANCE_PRESET=low_mid` (fewer streaming steps) or `ECHO_PERFORMANCE_PRESET=low` (smaller blocks + fewer steps) instead of manual step tweaks.
+- Compile vs presets: with `ECHO_COMPILE=1` you may be able to keep the higher (default) preset while staying real-time, but it raises peak VRAM; if memory is tight, turn compile off before lowering presets.
+- VRAM reduction: set `ECHO_FISH_DTYPE=bfloat16` (or `bf16`) to run the decoder in bf16 at a small quality cost.
+- Disable compile to save memory: set `ECHO_COMPILE=0` (model) and `ECHO_COMPILE_AE=0` (Fish AE, which defaults to compiled) if VRAM is constrained; expect slower generations.
 
 # Original README
 

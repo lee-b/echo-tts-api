@@ -3,6 +3,10 @@ import gzip
 import math
 import os
 import tempfile
+import io
+import wave
+import shutil
+import subprocess
 from dataclasses import dataclass, replace
 from contextlib import asynccontextmanager
 from functools import partial
@@ -53,8 +57,9 @@ DEFAULT_ZERO_EPS = 1.2e-2  # slightly looser to trigger early_stop on low-energy
 DEFAULT_ZERO_TAIL_FRAMES = 32
 DEFAULT_ZERO_TAIL_MIN_FRAC = 0.98
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
-DEFAULT_NUM_STEPS_NONSTREAM = 20
+DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
+FFMPEG_PATH = shutil.which("ffmpeg")
 
 MODEL_REPO = os.getenv("ECHO_MODEL_REPO", "jordand/echo-tts-base") # Model repo overriden when using LoRA
 PCA_REPO = os.getenv("ECHO_PCA_REPO", MODEL_REPO)
@@ -76,6 +81,22 @@ CHUNK_CHARS_PER_SECOND = float(os.getenv("ECHO_CHUNK_CHARS_PER_SECOND", "14"))
 CHUNK_WORDS_PER_SECOND = float(os.getenv("ECHO_CHUNK_WORDS_PER_SECOND", "2.7"))
 MAX_SPEAKER_LATENT_LENGTH = int(os.getenv("ECHO_MAX_SPEAKER_LATENT_LENGTH", "6400"))
 FOLDER_SUPPORT = os.getenv("ECHO_FOLDER_SUPPORT", "1") == "1"
+# Performance presets
+_PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", "default")
+PERFORMANCE_PRESET = _PERFORMANCE_PRESET_RAW.strip().lower().replace("-", "_")
+_PERFORMANCE_PRESETS = {
+    "default": {"block_sizes": [32, 128, 480], "num_steps": [8, 15, 20]},
+    "low_mid": {"block_sizes": [32, 128, 480], "num_steps": [8, 10, 15]},
+    "low": {"block_sizes": [32, 64, 272, 272], "num_steps": [8, 10, 15, 15]},
+}
+if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS:
+    preset = _PERFORMANCE_PRESETS[PERFORMANCE_PRESET]
+    DEFAULT_BLOCK_SIZES = list(preset["block_sizes"])
+    DEFAULT_NUM_STEPS = list(preset["num_steps"])
+elif PERFORMANCE_PRESET not in {"", "default"}:
+    print(
+        f"⚠️ Unknown ECHO_PERFORMANCE_PRESET '{_PERFORMANCE_PRESET_RAW}'; using default sampler settings."
+    )
 # LoRA settings
 LORA_FIRST_BLOCK = os.getenv("ECHO_LORA_FIRST_BLOCK", "0") == "1"
 LORA_REPO = os.getenv("ECHO_LORA_REPO", "")
@@ -356,6 +377,70 @@ def _find_voice_file(name: str) -> Optional[Path]:
                 continue
             return path
     return None
+
+
+def _list_voice_options() -> List[Dict[str, Any]]:
+    """
+    Enumerate available voice ids (file stems and folder names) across VOICE_DIRS.
+    Deduplicate by name; skip hidden entries; require at least one valid audio file for folders.
+    """
+    voices: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    roots = _voice_roots()
+
+    for directory in VOICE_DIRS:
+        if not directory.exists():
+            continue
+        try:
+            entries = list(directory.iterdir())
+        except (OSError, RuntimeError):
+            continue
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_file():
+                if entry.suffix.lower() not in _AUDIO_EXTS:
+                    continue
+                voice_name = entry.stem
+                if voice_name in seen:
+                    continue
+                if not _is_path_within_voice_dirs(entry, roots):
+                    continue
+                voices.append(
+                    {
+                        "object": "voice",
+                        "id": voice_name,
+                        "name": voice_name,
+                        "metadata": {"source": directory.name, "type": "file"},
+                    }
+                )
+                seen.add(voice_name)
+            elif entry.is_dir() and FOLDER_SUPPORT:
+                voice_name = entry.name
+                if voice_name in seen:
+                    continue
+                if not _is_path_within_voice_dirs(entry, roots):
+                    continue
+                has_audio = False
+                try:
+                    for child in entry.iterdir():
+                        if child.is_file() and child.suffix.lower() in _AUDIO_EXTS:
+                            has_audio = True
+                            break
+                except (OSError, RuntimeError):
+                    continue
+                if not has_audio:
+                    continue
+                voices.append(
+                    {
+                        "object": "voice",
+                        "id": voice_name,
+                        "name": voice_name,
+                        "metadata": {"source": directory.name, "type": "folder"},
+                    }
+                )
+                seen.add(voice_name)
+    return voices
 
 
 def _decode_base64_audio(encoded: str) -> Tuple[torch.Tensor, str]:
@@ -778,6 +863,59 @@ def _audio_to_pcm(audio: torch.Tensor) -> bytes:
     audio = audio.detach().float().cpu().squeeze()
     audio = torch.clamp(audio, -1.0, 1.0)
     return (audio * 32767.0).to(torch.int16).numpy().tobytes()
+
+
+def _pcm16_to_wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap little-endian 16-bit PCM into a WAV container."""
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm)
+        return buffer.getvalue()
+
+
+def _encode_mp3_from_pcm(pcm: bytes, sample_rate: int) -> bytes:
+    """
+    Encode raw PCM to MP3 using ffmpeg via stdin/stdout to avoid temp files.
+    Requires ffmpeg to be present on PATH; otherwise raises HTTPException.
+    """
+    if not FFMPEG_PATH:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format='mp3' requires ffmpeg in PATH",
+        )
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG_PATH,
+                "-v",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                "1",
+                "-i",
+                "-",
+                "-f",
+                "mp3",
+                "-",
+            ],
+            input=pcm,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to encode mp3") from exc
+    if result.returncode != 0 or not result.stdout:
+        err = (result.stderr or b"").decode(errors="ignore").strip()
+        _log_debug(f"[mp3] ffmpeg encode error rc={result.returncode} stderr={err}")
+        raise HTTPException(status_code=500, detail="Failed to encode mp3")
+    return bytes(result.stdout)
 
 
 def _save_debug_wav(tensor: torch.Tensor, path: str) -> None:
@@ -1398,7 +1536,10 @@ class SpeechRequest(BaseModel):
     model: str = Field(default="echo-tts")
     input: str = Field(..., description="Text to synthesize")
     voice: str = Field(..., description="Voice name (audio_prompts/prompt_audio/extra_prompt_audio) or base64 audio")
-    response_format: str = Field(default="pcm")
+    response_format: Optional[str] = Field(
+        default=None,
+        description="pcm only for streaming; non-stream supports pcm/wav/mp3 (defaults to mp3 if ffmpeg is available, else wav).",
+    )
     stream: bool = Field(default=True)
     seed: int = Field(default=0)
     extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional sampler overrides")
@@ -1413,9 +1554,34 @@ def _run_startup_tasks() -> None:
         _warmup_compile(DEFAULT_BLOCK_SIZES, DEFAULT_NUM_STEPS)
 
 
+def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
+    """Return a validated response format, defaulting by stream/non-stream."""
+    if requested is None or str(requested).strip() == "":
+        return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
+    fmt = str(requested).strip().lower()
+    allowed = {"pcm"} if stream else {"pcm", "wav", "mp3"}
+    if fmt not in allowed:
+        raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3'")
+    if stream and fmt != "pcm":
+        raise HTTPException(status_code=400, detail="Streaming currently supports response_format='pcm' only")
+    if (not stream) and fmt == "mp3" and not FFMPEG_PATH:
+        raise HTTPException(status_code=400, detail="response_format='mp3' requires ffmpeg in PATH")
+    return fmt
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/v1/voices")
+def list_voices() -> Dict[str, Any]:
+    """
+    OpenAI-compatible voices listing.
+    Returns audio file stems and folder names (if folder support is enabled) across VOICE_DIRS.
+    """
+    voices = _list_voice_options()
+    return {"object": "list", "data": voices}
 
 
 @app.post("/v1/audio/speech")
@@ -1423,6 +1589,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     route_start = time.time()
     _load_components()
     _log_debug(f"[route] after load_components: {(time.time() - route_start)*1000:.2f} ms")
+    response_format = _resolve_response_format(payload.response_format, payload.stream)
     sampler_cfg = _parse_sampler_config(payload.extra_body)
     _log_debug(f"[route] after parse_sampler_config: {(time.time() - route_start)*1000:.2f} ms")
     speaker_latent, speaker_mask = _get_speaker_latent(payload.voice)
@@ -1586,7 +1753,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                 rng_seed=chunk_seed,
             )
             collected.extend(audio_tensor)
-        audio_tensor = bytes(collected)
+            audio_tensor = bytes(collected)
     except RuntimeError as exc:
         if USE_COMPILE and _is_dynamo_fx_error(exc):
             _disable_compile(str(exc))
@@ -1614,9 +1781,19 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             _save_debug_wav(audio, "api_generation.wav")
         except Exception as exc:
             _log_debug(f"[debug] failed to save api_generation.wav: {exc}")
+
+    response_bytes = audio_tensor
+    media_type = "application/octet-stream"
+    if response_format == "wav":
+        response_bytes = _pcm16_to_wav_bytes(audio_tensor, SAMPLE_RATE)
+        media_type = "audio/wav"
+    elif response_format == "mp3":
+        response_bytes = _encode_mp3_from_pcm(audio_tensor, SAMPLE_RATE)
+        media_type = "audio/mpeg"
+
     return StreamingResponse(
-        content=iter([audio_tensor]),
-        media_type="application/octet-stream",
+        content=iter([response_bytes]),
+        media_type=media_type,
         headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
     )
 
