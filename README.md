@@ -37,7 +37,7 @@ URL: `http://localhost:8004/v1`
 Password/token/auth: `unused` (doesn't matter, literally unused)
 TTS Voice: `Scarlett-Her`
 
-TTS Model: `echo-tts``
+TTS Model: `echo-tts`
 
 Additional Parameters:
 ```
