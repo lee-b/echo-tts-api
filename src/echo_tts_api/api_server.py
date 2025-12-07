@@ -2,6 +2,7 @@ import base64
 import gzip
 import math
 import os
+import sys
 import tempfile
 import io
 import wave
@@ -16,14 +17,15 @@ from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional,
 
 import torch
 import time
+import uvicorn
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.concurrency import iterate_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 import torchaudio
-from utils import preprocess_text, chunk_text_by_time
-from inference import (
+from .utils import preprocess_text, chunk_text_by_time
+from .inference import (
     PCAState,
     ae_decode as _base_ae_decode,
     find_flattening_point,
@@ -34,8 +36,8 @@ from inference import (
     load_model_from_hf,
     load_pca_state_from_hf,
 )
-from autoencoder import DAC
-from samplers import (
+from .autoencoder import DAC
+from .samplers import (
     GuidanceMode,
     sample_euler_cfg_any,
     _get_first_n_kv_cache,
@@ -45,6 +47,7 @@ from samplers import (
 )
 
 SAMPLE_RATE = 44_100
+CHANNELS = 1
 
 DEFAULT_BLOCK_SIZES = [32, 128, 480]
 DEFAULT_NUM_STEPS = [8, 15, 20]
@@ -67,13 +70,14 @@ FISH_REPO = os.getenv("ECHO_FISH_REPO", "jordand/fish-s1-dac-min")
 DEVICE = os.getenv("ECHO_DEVICE", "cuda")
 FISH_DEVICE = os.getenv("ECHO_FISH_DEVICE", DEVICE)
 MODEL_DTYPE = os.getenv("ECHO_MODEL_DTYPE", "bfloat16")  # keep half-precision by default to avoid doubling VRAM
-FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float32")     # keep decoder in fp32 by default for quality
+#FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float32")     # keep decoder in fp32 by default for quality
+FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "bfloat16")     # keep decoder in fp32 by default for quality
 USE_COMPILE = os.getenv("ECHO_COMPILE", "0") == "1" # Takes several minutes to compile but cuts TTFB by 100~200ms
 COMPILE_AE = os.getenv("ECHO_COMPILE_AE", "1") == "1"
 CACHE_SPEAKER_ON_GPU = os.getenv("ECHO_CACHE_SPEAKER_ON_GPU", "0") == "1" # Provides speed-up by 20ms~60ms TTFB per request at cost of VRAM usage
 CACHE_VERSION = os.getenv("ECHO_CACHE_VERSION", "v1_0")
 CACHE_DIR = Path(os.getenv("ECHO_CACHE_DIR", "/tmp"))
-WARMUP_VOICE = os.getenv("ECHO_WARMUP_VOICE")
+WARMUP_VOICE = os.getenv("ECHO_WARMUP_VOICE", "Scarlett-Her")
 WARMUP_TEXT = os.getenv("ECHO_WARMUP_TEXT", "[S1] Warmup compile run.")
 # Chunking config (wiring TBD; previewed in scripts/chunk_preview.py)
 CHUNKING_ENABLED = os.getenv("ECHO_CHUNKING", "1") == "1"
@@ -118,12 +122,11 @@ async def lifespan(app: FastAPI):
     _run_startup_tasks()
     yield
 
-
-VOICE_DIRS = [
-    Path(__file__).resolve().parent / "audio_prompts",
-    Path(__file__).resolve().parent / "prompt_audio",
-    Path(__file__).resolve().parent / "extra_prompt_audio",
-]
+VOICE_DIRS = [ Path(x) for x in [
+    "audio_prompts",
+    "prompt_audio",
+    "extra_prompt_audio",
+] ]
 _AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus"}
 
 app = FastAPI(title="Echo-TTS API (streaming)", lifespan=lifespan)
@@ -512,7 +515,7 @@ def _load_speaker_latent_from_directory(directory_path: Path) -> Tuple[torch.Ten
     # Maximum duration: 5 minutes = 300 seconds
     MAX_DURATION_SECONDS = 300
     MAX_SAMPLES = int(MAX_DURATION_SECONDS * SAMPLE_RATE)
-    SILENCE = torch.zeros((1, SAMPLE_RATE), dtype=torch.float32)
+    SILENCE = torch.zeros((1, SAMPLE_RATE), dtype=torch.float32) # think '1' should be CHANNELS here? Think float32 should be from a constant?
 
     # Load each clip, trim to the remaining budget, and concatenate with 1s gaps.
     segments: List[torch.Tensor] = []
@@ -548,7 +551,7 @@ def _load_speaker_latent_from_directory(directory_path: Path) -> Tuple[torch.Ten
             detail=f"No valid audio could be loaded from directory: {directory_path}",
         )
 
-    combined_audio = torch.cat(segments, dim=1)
+    combined_audio = torch.cat(segments, dim=1) # think dim should be from CHANNELS here?
 
     with torch.inference_mode():
         fish_device = next(fish_ae.parameters()).device
@@ -560,7 +563,7 @@ def _load_speaker_latent_from_directory(directory_path: Path) -> Tuple[torch.Ten
         )
 
     # Trim to MAX_SPEAKER_LATENT_LENGTH if needed
-    if speaker_latent.shape[1] > MAX_SPEAKER_LATENT_LENGTH:
+    if speaker_latent.shape[1] > MAX_SPEAKER_LATENT_LENGTH: # think shape[1] should be shape[CHANNELS] here?
         print(
             f"[folder] Trimming concatenated latent from {speaker_latent.shape[1]} to {MAX_SPEAKER_LATENT_LENGTH}"
         )
@@ -711,7 +714,6 @@ def _get_speaker_latent(voice: str) -> Tuple[torch.Tensor, torch.Tensor]:
             _log_debug(f"[voice] gpu cache store {cache_key} dev={target_device_key} {(time.time() - t_start)*1000:.2f} ms")
 
     return _SPEAKER_CACHE[cache_key][0].to(target_device), _SPEAKER_CACHE[cache_key][1].to(target_device)
-
 
 def _pick_warmup_voice() -> Optional[str]:
     if WARMUP_VOICE:
@@ -1557,16 +1559,26 @@ def _run_startup_tasks() -> None:
 
 def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
     """Return a validated response format, defaulting by stream/non-stream."""
+
     if requested is None or str(requested).strip() == "":
         return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
+
     fmt = str(requested).strip().lower()
     allowed = {"pcm"} if stream else {"pcm", "wav", "mp3"}
+
     if fmt not in allowed:
-        raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3'")
+        msg = f"response_format must be one of {allowed!r}, but {fmt!r} was requested"
+        _log_debug(msg)
+        raise HTTPException(status_code=400, detail=msg)
+
     if stream and fmt != "pcm":
-        raise HTTPException(status_code=400, detail="Streaming currently supports response_format='pcm' only")
+        msg = "Streaming currently supports response_format='pcm' only"
+        raise HTTPException(status_code=400, detail=msg)
+
     if (not stream) and fmt == "mp3" and not FFMPEG_PATH:
-        raise HTTPException(status_code=400, detail="response_format='mp3' requires ffmpeg in PATH")
+        msg = "response_format='mp3' requires ffmpeg in PATH"
+        raise HTTPException(status_code=400, detail=msg)
+
     return fmt
 
 
@@ -1585,162 +1597,152 @@ def list_voices() -> Dict[str, Any]:
     return {"object": "list", "data": voices}
 
 
-@app.post("/v1/audio/speech")
-def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> StreamingResponse:
-    route_start = time.time()
-    _load_components()
-    _log_debug(f"[route] after load_components: {(time.time() - route_start)*1000:.2f} ms")
-    response_format = _resolve_response_format(payload.response_format, payload.stream)
-    sampler_cfg = _parse_sampler_config(payload.extra_body)
-    _log_debug(f"[route] after parse_sampler_config: {(time.time() - route_start)*1000:.2f} ms")
-    speaker_latent, speaker_mask = _get_speaker_latent(payload.voice)
-    _log_debug(f"[route] after get_speaker_latent: {(time.time() - route_start)*1000:.2f} ms")
-    chunking_raw = payload.extra_body.get("chunking_enabled", CHUNKING_ENABLED)
-    if isinstance(chunking_raw, str):
-        chunking_enabled = chunking_raw.strip().lower() not in {"0", "false", "no", "off", ""}
-    else:
-        chunking_enabled = bool(chunking_raw)
-    chunk_target_seconds = float(payload.extra_body.get("chunk_target_seconds", 30.0))
-    chunk_min_seconds = float(payload.extra_body.get("chunk_min_seconds", 20.0))
-    chunk_max_seconds = float(payload.extra_body.get("chunk_max_seconds", 40.0))
-    chunk_chars_per_sec = float(
-        payload.extra_body.get("chunk_chars_per_second", CHUNK_CHARS_PER_SECOND)
-    )
-    chunk_words_per_sec = float(
-        payload.extra_body.get("chunk_words_per_second", CHUNK_WORDS_PER_SECOND)
-    )
-    chunks: List[str]
-    if chunking_enabled:
-        chunks = chunk_text_by_time(
-            payload.input,
-            target_seconds=chunk_target_seconds,
-            min_seconds=chunk_min_seconds,
-            max_seconds=chunk_max_seconds,
-            chars_per_second=chunk_chars_per_sec,
-            words_per_second=chunk_words_per_sec,
-            normalize_exclamation=NORMALIZE_EXCLAMATION,
-        )
-        if not chunks:
-            chunks = [payload.input]
-    else:
-        chunks = [payload.input]
-    _log_debug(f"[route] chunking_enabled={chunking_enabled} chunks={len(chunks)}")
+@app.get("/v1/audio/voices")
+def list_voices() -> Dict[str, Any]:
+    """
+    OpenAI-compatible voices listing.
+    Returns audio file stems and folder names (if folder support is enabled) across VOICE_DIRS.
+    """
+    voices = _list_voice_options()
+    return {"object": "list", "data": voices}
 
-    if not payload.stream:
-        if "block_sizes" not in payload.extra_body:
-            sampler_cfg.block_sizes = [DEFAULT_BLOCK_SIZE_NONSTREAM]
-        if "num_steps" not in payload.extra_body:
-            sampler_cfg.num_steps = [DEFAULT_NUM_STEPS_NONSTREAM for _ in sampler_cfg.block_sizes]
 
-    chunk_cfgs: List[SamplerConfig]
-    override_secondary = (
-        payload.stream
-        and chunking_enabled
-        and len(chunks) > 1
-        and "block_sizes" not in payload.extra_body
-        and "num_steps" not in payload.extra_body
-    )
-    if override_secondary:
-        secondary_cfg = replace(
-            sampler_cfg,
-            block_sizes=[DEFAULT_BLOCK_SIZE_NONSTREAM],
-            num_steps=[DEFAULT_NUM_STEPS_NONSTREAM],
-        )
-        chunk_cfgs = [sampler_cfg] + [secondary_cfg for _ in chunks[1:]]
-    else:
-        chunk_cfgs = [sampler_cfg for _ in chunks]
+@app.post("/v1/audio/models")
+def list_models(request: Request) -> Response:
+    default_model = "echo-tts"
+    fake_models = [ "tts-1", "tts-1-hd" ]
 
-    if payload.stream:
-        collected: Optional[bytearray] = bytearray() if DEBUG_LOGS_ENABLED else None
-        disconnect_exception: type[Exception] = type("ClientDisconnected", (Exception,), {})
+    models_list = [default_model] + fake_models
 
-        def _run_stream() -> Iterable[bytes]:
-            for idx, chunk in enumerate(chunks):
-                chunk_seed = payload.seed + idx
-                cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
-                _log_debug(f"[route] starting chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
-                for block in _stream_blocks(
-                    text=chunk,
-                    speaker_latent=speaker_latent,
-                    speaker_mask=speaker_mask,
-                    cfg=cfg_for_chunk,
-                    rng_seed=chunk_seed,
-                ):
-                    yield block
+    return { 'object': 'list', 'data': { 'models': models_list } }
 
-        async def _drain_stream(stream_iter: Iterator[bytes]) -> AsyncIterator[bytes]:
-            async for chunk in iterate_in_threadpool(stream_iter):
-                if await request.is_disconnected():
-                    _log_debug("[route] client disconnected; stopping stream generation")
-                    raise disconnect_exception()
-                yield chunk
 
-        def _close_iter(stream_iter: Optional[Iterator[bytes]]) -> None:
-            if stream_iter is None:
-                return
-            close_fn = getattr(stream_iter, "close", None)
-            if close_fn is None:
-                return
+def response_format_to_mimetype(response_format: str, sample_rate: int, channels: int) -> (str, dict[str, Any]):
+    headers={}
+
+    if response_format == "wav":
+        mimetype = "audio/wav"
+
+    elif response_format == "mp3":
+        mimetype = "audio/mpeg"
+
+    elif response_format == "pcm":
+       #mimetype = "application/octet-stream" # original code sent this, isn't correct, but might be necessary for OpenAI and/or client compatibility?
+        mimetype = f"audio/L16; rate={sample_rate}; channels={channels}"
+
+        headers["X-Audio-Sample-Rate"] = str(SAMPLE_RATE)
+
+    _log_debug(f"response_format_to_mimetype: {response_format=}, {sample_rate=}, {channels=}; returning {mimetype=}, {headers=}")
+
+    return mimetype, headers
+
+
+def create_streaming_speech(request, route_start, payload, chunk_cfgs, chunks, speaker_latent, speaker_mask):
+    _log_debug("create_streaming_speech(): entry.")
+
+    collected: Optional[bytearray] = bytearray() if DEBUG_LOGS_ENABLED else None
+    disconnect_exception: type[Exception] = type("ClientDisconnected", (Exception,), {})
+
+    def _run_stream() -> Iterable[bytes]:
+        for idx, chunk in enumerate(chunks):
+            chunk_seed = payload.seed + idx
+            cfg_for_chunk = chunk_cfgs[idx] if idx < len(chunk_cfgs) else sampler_cfg
+            _log_debug(f"[route] starting chunk {idx+1}/{len(chunks)} seed={chunk_seed}")
+            for block in _stream_blocks(
+                text=chunk,
+                speaker_latent=speaker_latent,
+                speaker_mask=speaker_mask,
+                cfg=cfg_for_chunk,
+                rng_seed=chunk_seed,
+            ):
+                yield block
+
+    async def _drain_stream(stream_iter: Iterator[bytes]) -> AsyncIterator[bytes]:
+        async for chunk in iterate_in_threadpool(stream_iter):
+            if await request.is_disconnected():
+                _log_debug("[route] client disconnected; stopping stream generation")
+                raise disconnect_exception()
+            yield chunk
+
+    def _close_iter(stream_iter: Optional[Iterator[bytes]]) -> None:
+        if stream_iter is None:
+            return
+        close_fn = getattr(stream_iter, "close", None)
+        if close_fn is None:
+            return
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+    async def _generator() -> AsyncIterator[bytes]:
+        emitted = False
+        _log_debug(f"[route] generator entered: {(time.time() - route_start)*1000:.2f} ms")
+
+        stream_iter: Optional[Iterator[bytes]] = None
+        try:
+            stream_iter = _run_stream()
             try:
-                close_fn()
-            except Exception:
-                pass
-
-        async def _generator() -> AsyncIterator[bytes]:
-            emitted = False
-            _log_debug(f"[route] generator entered: {(time.time() - route_start)*1000:.2f} ms")
-
-            stream_iter: Optional[Iterator[bytes]] = None
-            try:
-                stream_iter = _run_stream()
-                try:
+                async for chunk in _drain_stream(stream_iter):
+                    emitted = True
+                    if collected is not None:
+                        collected.extend(chunk)
+                    yield chunk
+            except disconnect_exception:
+                _log_debug("[route] disconnect propagated; aborting remaining chunks")
+            except RuntimeError as exc:
+                _log_debug(f"create_streaming_speech(): RuntimeError: {exc!r}")
+                if emitted or not USE_COMPILE:
+                    _log_debug("create_streaming_speech(): RuntimeError: {exc!r}. Emitted or not USE_COMPILE. re-raising.")
+                    raise
+                if _is_dynamo_fx_error(exc):
+                    _log_debug("create_streaming_speech(): is_dynamo_fx_error.")
+                    _disable_compile(str(exc))
+                    _load_components(force_reinit=True, force_compile=False)
+                    _close_iter(stream_iter)
+                    stream_iter = _run_stream()
                     async for chunk in _drain_stream(stream_iter):
-                        emitted = True
                         if collected is not None:
                             collected.extend(chunk)
+                        _log_debug("create_streaming_speech(): is_dynamo_fx_error. Yielding chunk.")
                         yield chunk
-                except disconnect_exception:
-                    _log_debug("[route] disconnect propagated; aborting remaining chunks")
-                except RuntimeError as exc:
-                    if emitted or not USE_COMPILE:
-                        raise
-                    if _is_dynamo_fx_error(exc):
-                        _disable_compile(str(exc))
-                        _load_components(force_reinit=True, force_compile=False)
-                        _close_iter(stream_iter)
-                        stream_iter = _run_stream()
-                        async for chunk in _drain_stream(stream_iter):
-                            if collected is not None:
-                                collected.extend(chunk)
-                            yield chunk
-                    else:
-                        raise
-            finally:
-                _close_iter(stream_iter)
+                else:
+                    _log_debug("create_streaming_speech(): not dynamo_fx_error. Re-raising.")
+                    raise
+        finally:
+            _log_debug("create_streaming_response(): _generator(): closing stream_iter.")
+            _close_iter(stream_iter)
 
-        response = StreamingResponse(
-            _generator(),
-            media_type="application/octet-stream",
-            headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
-        )
-        _log_debug(
-            f"[route] response constructed (headers about to send): {(time.time() - route_start)*1000:.2f} ms"
-        )
+    async def _save_generated_audio_as_a_file_for_debugging():
+        if not collected:
+            _log_debug(f"[debug] _save_generated_audio_as_a_file_for_debugging(): !collected. Returning.")
+            return
 
-        async def _save_after():
-            if collected:
-                try:
-                    int16_audio = torch.frombuffer(memoryview(collected), dtype=torch.int16)
-                    audio = int16_audio.float() / 32767.0
-                    _save_debug_wav(audio, "api_generation.wav")
-                except Exception as exc:
-                    _log_debug(f"[debug] failed to save api_generation.wav: {exc}")
+        try:
+            int16_audio = torch.frombuffer(memoryview(collected), dtype=torch.int16)
+            audio = int16_audio.float() / 32767.0
+            _save_debug_wav(audio, "api_generation.wav")
+        except Exception as exc:
+            _log_debug(f"[debug] failed to save api_generation.wav: {exc}")
 
-        if collected is not None:
-            response.background = _save_after  # type: ignore
-        return response
+    response_format = _resolve_response_format(payload.response_format, payload.stream)
+    mimetype, headers = response_format_to_mimetype(response_format, SAMPLE_RATE, CHANNELS)
 
-    # For stream=false, generate full audio, save for inspection, then return
+    response = StreamingResponse(
+        _generator(),
+        media_type=mimetype,
+        headers=headers,
+        background=_save_generated_audio_as_a_file_for_debugging if collected else None
+    )
+
+    return response
+
+
+def create_nonstreaming_speech(request, route_start, payload, chunk_cfgs, chunks, speaker_latent, speaker_mask) -> StreamingResponse: # TODO: the return type is a contradiction??
+    # For stream=false, generate full audio, save for inspection (if debugging), then return
+
+    response_format = _resolve_response_format(payload.response_format, payload.stream)
+
     try:
         collected = bytearray()
         for idx, chunk in enumerate(chunks):
@@ -1776,6 +1778,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             audio_tensor = bytes(collected)
         else:
             raise
+
     if DEBUG_LOGS_ENABLED:
         try:
             int16_audio = torch.frombuffer(memoryview(audio_tensor), dtype=torch.int16)
@@ -1785,22 +1788,126 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             _log_debug(f"[debug] failed to save api_generation.wav: {exc}")
 
     response_bytes = audio_tensor
-    media_type = "application/octet-stream"
+
     if response_format == "wav":
         response_bytes = _pcm16_to_wav_bytes(audio_tensor, SAMPLE_RATE)
-        media_type = "audio/wav"
     elif response_format == "mp3":
         response_bytes = _encode_mp3_from_pcm(audio_tensor, SAMPLE_RATE)
-        media_type = "audio/mpeg"
+    elif response_format == "pcm":
+        # no conversion needed here
+        pass
+    else:
+        raise InternalError(f"create_nonstreaming_speech(): response_format {response_format} is not implemented!")
 
-    return StreamingResponse(
+    mimetype, headers = response_type_to_mimetype(response_format, SAMPLE_RATE, CHANNELS)
+
+    response = StreamingResponse(
         content=iter([response_bytes]),
-        media_type=media_type,
-        headers={"X-Audio-Sample-Rate": str(SAMPLE_RATE)},
+        media_type=mimetype,
+        headers=headers,
     )
+
+    return response
+
+
+def create_speech_chunks(payload, route_start):
+    sampler_cfg = _parse_sampler_config(payload.extra_body)
+    _log_debug(f"[route] after parse_sampler_config: {(time.time() - route_start)*1000:.2f} ms") # expensive, even when not debugging
+
+    chunking_raw = payload.extra_body.get("chunking_enabled", CHUNKING_ENABLED)
+
+    if isinstance(chunking_raw, str):
+        chunking_enabled = chunking_raw.strip().lower() not in {"0", "false", "no", "off", ""}
+    else:
+        chunking_enabled = bool(chunking_raw)
+
+    chunk_target_seconds = float(payload.extra_body.get("chunk_target_seconds", 30.0))
+    chunk_min_seconds = float(payload.extra_body.get("chunk_min_seconds", 20.0))
+    chunk_max_seconds = float(payload.extra_body.get("chunk_max_seconds", 40.0))
+    chunk_chars_per_sec = float(
+        payload.extra_body.get("chunk_chars_per_second", CHUNK_CHARS_PER_SECOND)
+    )
+    chunk_words_per_sec = float(
+        payload.extra_body.get("chunk_words_per_second", CHUNK_WORDS_PER_SECOND)
+    )
+
+    chunks: List[str]
+    if chunking_enabled:
+        chunks = chunk_text_by_time(
+            payload.input,
+            target_seconds=chunk_target_seconds,
+            min_seconds=chunk_min_seconds,
+            max_seconds=chunk_max_seconds,
+            chars_per_second=chunk_chars_per_sec,
+            words_per_second=chunk_words_per_sec,
+            normalize_exclamation=NORMALIZE_EXCLAMATION,
+        )
+        if not chunks:
+            chunks = [payload.input]
+    else:
+        chunks = [payload.input]
+
+    _log_debug(f"[route] chunking_enabled={chunking_enabled} chunks={len(chunks)}")
+
+    if not payload.stream:
+        if "block_sizes" not in payload.extra_body:
+            sampler_cfg.block_sizes = [DEFAULT_BLOCK_SIZE_NONSTREAM]
+        if "num_steps" not in payload.extra_body:
+            sampler_cfg.num_steps = [DEFAULT_NUM_STEPS_NONSTREAM for _ in sampler_cfg.block_sizes]
+
+    chunk_cfgs: List[SamplerConfig]
+    override_secondary = (
+        payload.stream
+        and chunking_enabled
+        and len(chunks) > 1
+        and "block_sizes" not in payload.extra_body
+        and "num_steps" not in payload.extra_body
+    )
+    if override_secondary:
+        secondary_cfg = replace(
+            sampler_cfg,
+            block_sizes=[DEFAULT_BLOCK_SIZE_NONSTREAM],
+            num_steps=[DEFAULT_NUM_STEPS_NONSTREAM],
+        )
+        chunk_cfgs = [sampler_cfg] + [secondary_cfg for _ in chunks[1:]]
+    else:
+        chunk_cfgs = [sampler_cfg for _ in chunks]
+
+    return chunk_cfgs, chunks
+
+
+@app.post("/v1/audio/speech")
+def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> StreamingResponse:
+    route_start = time.time()
+
+    _load_components()
+    _log_debug(f"[route] after load_components: {(time.time() - route_start)*1000:.2f} ms") # expensive, even when not debugging
+
+    chunk_cfgs, chunks = create_speech_chunks(payload, route_start)
+
+    speaker_latent, speaker_mask = _get_speaker_latent(payload.voice)
+    _log_debug(f"[route] after get_speaker_latent: {(time.time() - route_start)*1000:.2f} ms") # expensive, even when not debugging
+    
+
+    if payload.stream:
+        _log_debug(f"payload stream: {payload.stream}. Calling create_streaming_speech.") # expensive, even when not debugging
+        resp = create_streaming_speech(request, route_start, payload, chunk_cfgs, chunks, speaker_latent, speaker_mask)
+    else:
+        _log_debug(f"payload stream: {payload.stream}. Calling create_nonstreaming_speech.") # expensive, even when not debugging
+        resp = create_nonstreaming_speech(request, route_start, payload, chunk_cfgs, chunks, speaker_latent, speaker_mask)
+
+    _log_debug(
+        f"[route] response constructed (headers about to send): {(time.time() - route_start)*1000:.2f} ms"
+    )
+
+    assert isinstance(resp, StreamingResponse)
+
+    return resp
+
+def main():
+    uvicorn.run("echo_tts_api.api_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8004")), reload=False)
 
 
 if __name__ == "__main__":
-    import uvicorn
+    sys.exit(main())
 
-    uvicorn.run("api_server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)

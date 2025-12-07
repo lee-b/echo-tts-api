@@ -8,7 +8,7 @@ from inference import (
     _multiply_kv_cache,
     _temporal_score_rescale,
 )
-from model import EchoDiT
+from .model import EchoDiT
 
 
 @torch.inference_mode()

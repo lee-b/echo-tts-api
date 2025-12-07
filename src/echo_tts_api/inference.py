@@ -8,8 +8,8 @@ import torch
 import torchaudio
 from torchcodec.decoders import AudioDecoder
 
-from autoencoder import DAC, build_ae
-from model import EchoDiT
+from .autoencoder import DAC, build_ae
+from .model import EchoDiT
 
 
 LORA_ALPHA = 32.0

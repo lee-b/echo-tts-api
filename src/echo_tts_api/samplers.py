@@ -3,7 +3,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from model import EchoDiT
+from .model import EchoDiT
 
 
 def _get_uncond_text_input_ids_and_mask(

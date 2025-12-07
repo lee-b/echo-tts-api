@@ -1,0 +1,35 @@
+[project]
+name = "echo-tts-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Lee Braiden", email = "lee.braiden@pm.me" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "einops>=0.7.0",
+    "fastapi>=0.104.0",
+    "gradio==5.49.1",
+    "huggingface-hub>=0.20.0",
+    "numpy>=1.24.0",
+    "pydantic>=2.0.0",
+    "safetensors>=0.4.2",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchcodec>=0.8.1",
+    "uvicorn>=0.24.0",
+]
+
+[project.scripts]
+echo-tts-api = "echo_tts_api.api_server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pudb>=2025.1.5",
+    "ruff>=0.14.8",
+]
