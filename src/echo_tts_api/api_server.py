@@ -67,13 +67,13 @@ FFMPEG_PATH = shutil.which("ffmpeg")
 MODEL_REPO = os.getenv("ECHO_MODEL_REPO", "jordand/echo-tts-base") # Model repo overriden when using LoRA
 PCA_REPO = os.getenv("ECHO_PCA_REPO", MODEL_REPO)
 FISH_REPO = os.getenv("ECHO_FISH_REPO", "jordand/fish-s1-dac-min")
-DEVICE = os.getenv("ECHO_DEVICE", "cuda")
-FISH_DEVICE = os.getenv("ECHO_FISH_DEVICE", DEVICE)
-MODEL_DTYPE = os.getenv("ECHO_MODEL_DTYPE", "bfloat16")  # keep half-precision by default to avoid doubling VRAM
+DEVICE = os.getenv("ECHO_DEVICE", "cuda:0")
+FISH_DEVICE = os.getenv("ECHO_FISH_DEVICE", DEVICE) # separate devices breaks
+MODEL_DTYPE = os.getenv("ECHO_MODEL_DTYPE", "float16")  # keep half-precision by default to avoid doubling VRAM
 #FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float32")     # keep decoder in fp32 by default for quality
-FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "bfloat16")     # keep decoder in fp32 by default for quality
+FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float16")     # keep decoder in fp32 by default for quality
 USE_COMPILE = os.getenv("ECHO_COMPILE", "0") == "1" # Takes several minutes to compile but cuts TTFB by 100~200ms
-COMPILE_AE = os.getenv("ECHO_COMPILE_AE", "1") == "1"
+COMPILE_AE = os.getenv("ECHO_COMPILE_AE", "0") == "1"
 CACHE_SPEAKER_ON_GPU = os.getenv("ECHO_CACHE_SPEAKER_ON_GPU", "0") == "1" # Provides speed-up by 20ms~60ms TTFB per request at cost of VRAM usage
 CACHE_VERSION = os.getenv("ECHO_CACHE_VERSION", "v1_0")
 CACHE_DIR = Path(os.getenv("ECHO_CACHE_DIR", "/tmp"))
@@ -321,9 +321,11 @@ def _voice_roots() -> List[Path]:
 
     roots: List[Path] = []
 
-    for directory in VOICE_DIRS:
+    for rel_dir_path in [ Path(p) for p in VOICE_DIRS ]:
         try:
-            roots.append(directory.resolve())
+            resolved_dir_path = rel_dir_path.resolve()
+            if resolved_dir_path.exists():
+                roots.append(resolved_dir_path)
         except (OSError, RuntimeError):
             continue
 
@@ -1572,26 +1574,29 @@ def _run_startup_tasks() -> None:
 def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
     """Return a validated response format, defaulting by stream/non-stream."""
 
-    if requested is None or str(requested).strip() == "":
-        return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
+    reasons = set()
+    available_formats = { "mp3", "wav", "pcm" }
 
-    fmt = str(requested).strip().lower()
-    allowed = {"pcm"} if stream else {"pcm", "wav", "mp3"}
+    if not FFMPEG_PATH:
+        available_formats -= { "mp3" }
+        reasons.add(f"mp3 is not available because FFMPEG was not found on the system ({FFMPEG_PATH=})")
 
-    if fmt not in allowed:
-        msg = f"response_format must be one of {allowed!r}, but {fmt!r} was requested"
+    if stream:
+        available_formats -= { "wav" }
+        reasons.add("wav isn't implemented for streaming because it requires frame header offset tracking and adjustment per chunk")
+
+    if requested and requested not in available_formats:
+        msg = f"Generation of requested media format {fmt} is not available. Reasons: {reasons.join('; ')}"
         _log_debug(msg)
         raise HTTPException(status_code=400, detail=msg)
 
-    if stream and fmt != "pcm":
-        msg = "Streaming currently supports response_format='pcm' only"
-        raise HTTPException(status_code=400, detail=msg)
+    if not requested:
+        assert len(available_formats) >= 0, "Expected at least one available output media format to be available in all modes."
+        resolved_format = available_formats[0]
+    else:
+        resolved_format = requested
 
-    if (not stream) and fmt == "mp3" and not FFMPEG_PATH:
-        msg = "response_format='mp3' requires ffmpeg in PATH"
-        raise HTTPException(status_code=400, detail=msg)
-
-    return fmt
+    return resolved_format
 
 
 @app.get("/health")
@@ -1655,6 +1660,9 @@ def create_streaming_speech(request, route_start, payload, chunk_cfgs, chunks, s
     collected: Optional[bytearray] = bytearray() if DEBUG_LOGS_ENABLED else None
     disconnect_exception: type[Exception] = type("ClientDisconnected", (Exception,), {})
 
+    response_format = _resolve_response_format(payload.response_format, payload.stream)
+    mimetype, headers = response_format_to_mimetype(response_format, SAMPLE_RATE, CHANNELS)
+
     def _run_stream() -> Iterable[bytes]:
         for idx, chunk in enumerate(chunks):
             chunk_seed = payload.seed + idx
@@ -1667,7 +1675,13 @@ def create_streaming_speech(request, route_start, payload, chunk_cfgs, chunks, s
                 cfg=cfg_for_chunk,
                 rng_seed=chunk_seed,
             ):
-                yield block
+                if response_format == "mp3":
+                    yield _encode_mp3_from_pcm(block, SAMPLE_RATE)
+                elif response_format == "pcm":
+                    yield block
+                else:
+                    implemented = False
+                    assert implemented == True, f"create_streaming_speech(): audio format {response_format} isn't supported when stream == true"
 
     async def _drain_stream(stream_iter: Iterator[bytes]) -> AsyncIterator[bytes]:
         async for chunk in iterate_in_threadpool(stream_iter):
@@ -1736,9 +1750,6 @@ def create_streaming_speech(request, route_start, payload, chunk_cfgs, chunks, s
             _save_debug_wav(audio, "api_generation.wav")
         except Exception as exc:
             _log_debug(f"[debug] failed to save api_generation.wav: {exc}")
-
-    response_format = _resolve_response_format(payload.response_format, payload.stream)
-    mimetype, headers = response_format_to_mimetype(response_format, SAMPLE_RATE, CHANNELS)
 
     response = StreamingResponse(
         _generator(),
