@@ -32,14 +32,12 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 Configure Open-WebUI's `Admin->Audio->Speech` section as follows:
 
-Text-to-speech Engine: `OpenAI`
-URL: `http://localhost:8004/v1`
-Password/token/auth: `unused` (doesn't matter, literally unused)
-TTS Voice: `Scarlett-Her`
-
-TTS Model: `echo-tts`
-
-Additional Parameters:
+- Text-to-speech Engine: `OpenAI`
+- URL: `http://localhost:8004/v1`
+- Password/token/auth: `unused` (doesn't matter; it's literally unused)
+- TTS Voice: `Scarlett-Her`
+- TTS Model: `echo-tts`
+- Additional Parameters:
 ```
 {
   "response_format": "mp3",
