@@ -53,9 +53,9 @@ DEFAULT_CFG_SPEAKER = 8.0
 DEFAULT_CFG_MIN_T = 0.5
 DEFAULT_CFG_MAX_T = 1.0
 DEFAULT_EARLY_STOP = True
-DEFAULT_ZERO_EPS = 1.2e-2  # slightly looser to trigger early_stop on low-energy tails
-DEFAULT_ZERO_TAIL_FRAMES = 32
-DEFAULT_ZERO_TAIL_MIN_FRAC = 0.98
+DEFAULT_ZERO_EPS = 2.0e-2  # even looser to trigger early_stop on low-energy tails
+DEFAULT_ZERO_TAIL_FRAMES = 16
+DEFAULT_ZERO_TAIL_MIN_FRAC = 0.95
 DEFAULT_BLOCK_SIZE_NONSTREAM = 640
 DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
@@ -79,6 +79,7 @@ WARMUP_TEXT = os.getenv("ECHO_WARMUP_TEXT", "[S1] Warmup compile run.")
 CHUNKING_ENABLED = os.getenv("ECHO_CHUNKING", "1") == "1"
 CHUNK_CHARS_PER_SECOND = float(os.getenv("ECHO_CHUNK_CHARS_PER_SECOND", "14"))
 CHUNK_WORDS_PER_SECOND = float(os.getenv("ECHO_CHUNK_WORDS_PER_SECOND", "2.7"))
+NORMALIZE_EXCLAMATION = os.getenv("ECHO_NORMALIZE_EXCLAMATION", "1") == "1"
 MAX_SPEAKER_LATENT_LENGTH = int(os.getenv("ECHO_MAX_SPEAKER_LATENT_LENGTH", "6400"))
 FOLDER_SUPPORT = os.getenv("ECHO_FOLDER_SUPPORT", "1") == "1"
 # Performance presets
@@ -1034,7 +1035,7 @@ def _generate_full_audio_bytes(
     cfg: SamplerConfig,
     rng_seed: int,
 ) -> bytes:
-    text = preprocess_text(text)
+    text = preprocess_text(text, normalize_exclamation=NORMALIZE_EXCLAMATION)
 
     model, fish_ae, pca_state = _load_components()
     device = model.device
@@ -1177,7 +1178,7 @@ def _stream_blocks(
     cfg: SamplerConfig,
     rng_seed: int,
 ) -> Iterator[bytes]:
-    text = preprocess_text(text)
+    text = preprocess_text(text, normalize_exclamation=NORMALIZE_EXCLAMATION)
     if cfg.guidance_mode != GuidanceMode.INDEPENDENT:
         raise HTTPException(
             status_code=400,
@@ -1617,6 +1618,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             max_seconds=chunk_max_seconds,
             chars_per_second=chunk_chars_per_sec,
             words_per_second=chunk_words_per_sec,
+            normalize_exclamation=NORMALIZE_EXCLAMATION,
         )
         if not chunks:
             chunks = [payload.input]

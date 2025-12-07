@@ -1,5 +1,7 @@
 import re
-from typing import Iterable, List, Tuple
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable, List, Match, Tuple
 
 # Basic abbreviations to avoid false sentence splits.
 ABBREVIATIONS = {
@@ -28,10 +30,59 @@ ABBREVIATIONS = {
 SPEAKER_TAG_PATTERN = re.compile(r"(\[S\d+\])")
 POTENTIAL_END_PATTERN = re.compile(r'([.!?])(["\']?)(\s+|$)')
 BULLET_POINT_PATTERN = re.compile(r"(?:^|\n)\s*([-•*]|\d+\.)\s+")
+ALL_CAPS_WORD_PATTERN = re.compile(r"\b([A-Z]{2,})(?:'S|'s)?\b")
+EXCLAMATION_PATTERN = re.compile(r"!+")
+SENTENCE_START_PATTERN = re.compile(r"(?:(?<=^)|(?<=[.!?]\s)|(?<=\]\s))([a-z])")
+ABBREVIATIONS_FILE = Path(__file__).resolve().parent / "abbreviations.txt"
 
 
-def preprocess_text(text: str) -> str:
-    """Normalize text, strip quotes, collapse whitespace, and ensure a speaker tag."""
+@lru_cache(maxsize=1)
+def _load_uppercase_abbreviations() -> set[str]:
+    preserved: set[str] = set()
+    try:
+        with ABBREVIATIONS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                word = line.strip()
+                if not word or word.startswith("#"):
+                    continue
+                preserved.add(word.upper())
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return set()
+    return preserved
+
+
+def _lowercase_caps_except_abbreviations(text: str) -> str:
+    preserved = _load_uppercase_abbreviations()
+
+    def repl(match: Match[str]) -> str:
+        word = match.group(1)
+        suffix = match.group(0)[len(word) :]
+        if word in preserved:
+            return f"{word}{suffix}"
+        return f"{word.lower()}{suffix}"
+
+    return ALL_CAPS_WORD_PATTERN.sub(repl, text)
+
+
+def _normalize_exclamation(text: str) -> str:
+    def repl(match: Match[str]) -> str:
+        span = match.group(0)
+        return "." if len(span) == 1 else "!"
+
+    return EXCLAMATION_PATTERN.sub(repl, text)
+
+
+def _capitalize_sentence_starts(text: str) -> str:
+    def repl(match: Match[str]) -> str:
+        return match.group(1).upper()
+
+    return SENTENCE_START_PATTERN.sub(repl, text)
+
+
+def preprocess_text(text: str, normalize_exclamation: bool = True) -> str:
+    """Normalize text, optionally tame exclamation runs, downcase shouting words (except known abbreviations), strip quotes, collapse whitespace, and ensure a speaker tag."""
     replacements = [
         ("…", ","),
         ("—", ", "),
@@ -47,8 +98,12 @@ def preprocess_text(text: str) -> str:
     for src, dst in replacements:
         text = text.replace(src, dst)
 
+    if normalize_exclamation:
+        text = _normalize_exclamation(text)
     text = text.encode("ascii", "ignore").decode("ascii")
     text = " ".join(text.split())
+    text = _lowercase_caps_except_abbreviations(text)
+    text = _capitalize_sentence_starts(text)
 
     if text and not text.startswith("[") and not text.startswith("(") and "S1" not in text and "S2" not in text:
         text = f"[S1] {text}"
@@ -200,9 +255,10 @@ def chunk_text_by_time(
     max_seconds: float = 40.0,
     chars_per_second: float = 14.0,
     words_per_second: float = 2.7,
+    normalize_exclamation: bool = True,
 ) -> List[str]:
     """Chunk text into ~time-sized pieces, keeping tag changes inline."""
-    cleaned = preprocess_text(full_text)
+    cleaned = preprocess_text(full_text, normalize_exclamation=normalize_exclamation)
     tagged_sentences = _preprocess_and_tag_sentences(cleaned)
     if not tagged_sentences:
         return []
