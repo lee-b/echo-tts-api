@@ -22,6 +22,7 @@ RUN rm -rf /tmp/wheels
 
 WORKDIR /app
 RUN mkdir audio_prompts
+COPY abbreviations.txt .
 
 EXPOSE 8004
 

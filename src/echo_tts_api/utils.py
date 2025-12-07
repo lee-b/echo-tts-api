@@ -33,7 +33,7 @@ BULLET_POINT_PATTERN = re.compile(r"(?:^|\n)\s*([-•*]|\d+\.)\s+")
 ALL_CAPS_WORD_PATTERN = re.compile(r"\b([A-Z]{2,})(?:'S|'s)?\b")
 EXCLAMATION_PATTERN = re.compile(r"!+")
 SENTENCE_START_PATTERN = re.compile(r"(?:(?<=^)|(?<=[.!?]\s)|(?<=\]\s))([a-z])")
-ABBREVIATIONS_FILE = Path(__file__).resolve().parent / "abbreviations.txt"
+ABBREVIATIONS_FILE = Path("abbreviations.txt")
 
 
 @lru_cache(maxsize=1)
