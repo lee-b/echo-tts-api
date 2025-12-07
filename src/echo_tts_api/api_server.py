@@ -316,12 +316,19 @@ def _load_components(
 
 def _voice_roots() -> List[Path]:
     """Resolved voice roots (skip paths that cannot be resolved)."""
+
+    assert all(isinstance(d, Path) for d in VOICE_DIRS)
+
     roots: List[Path] = []
+
     for directory in VOICE_DIRS:
         try:
             roots.append(directory.resolve())
         except (OSError, RuntimeError):
             continue
+
+    assert all(isinstance(d, Path) for d in roots)
+
     return roots
 
 
@@ -331,6 +338,9 @@ def _is_path_within_voice_dirs(path: Path, roots: Iterable[Path]) -> bool:
         resolved = path.resolve()
     except (OSError, RuntimeError):
         return False
+
+    assert isinstance(resolved, Path)
+    assert all(isinstance(d, Path) for d in roots)
 
     for root in roots:
         try:
@@ -348,8 +358,10 @@ def _find_voice_file(name: str) -> Optional[Path]:
         return None
 
     roots = _voice_roots()
+
     name_path = Path(sanitized)
 
+    assert all(isinstance(d, Path) for d in VOICE_DIRS)
     for directory in VOICE_DIRS:
         if not directory.exists():
             continue
