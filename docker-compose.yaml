@@ -12,7 +12,6 @@ services:
               capabilities: [gpu]
     volumes:
       - "./audio_prompts:/app/audio_prompts"
-      - "../../data/cache/huggingface:/root/.cache/huggingface"
     runtime: nvidia
     restart: unless-stopped
 

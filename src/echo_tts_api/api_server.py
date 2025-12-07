@@ -1607,7 +1607,7 @@ def list_voices() -> Dict[str, Any]:
     return {"object": "list", "data": voices}
 
 
-@app.post("/v1/audio/models")
+@app.get("/v1/audio/models")
 def list_models(request: Request) -> Response:
     default_model = "echo-tts"
     fake_models = [ "tts-1", "tts-1-hd" ]
@@ -1799,7 +1799,7 @@ def create_nonstreaming_speech(request, route_start, payload, chunk_cfgs, chunks
     else:
         raise InternalError(f"create_nonstreaming_speech(): response_format {response_format} is not implemented!")
 
-    mimetype, headers = response_type_to_mimetype(response_format, SAMPLE_RATE, CHANNELS)
+    mimetype, headers = response_format_to_mimetype(response_format, SAMPLE_RATE, CHANNELS)
 
     response = StreamingResponse(
         content=iter([response_bytes]),

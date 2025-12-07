@@ -8,3 +8,5 @@ venv/
 .vscode/
 api_generation.wav
 test.bash
+send_test_audio_request.bash
+test_request.json
